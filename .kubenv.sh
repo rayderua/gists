@@ -2,10 +2,14 @@
 KUBENV_SUFFIX="${HOME}/.kube/kubenv/"
 KUBENV_KUBECONFIG_DEFAULT="${HOME}/.kube/config"
 KUBENV_CONFIG_D="${HOME}/.kube/config.d"
+KUBENV_BACKUP_D="${KUBENV_SUFFIX}backups"
 
-# Files older than this age (in minutes) are removed automatically on
-# startup, provided they are not currently held open by any live process.
+# Temp files of other sessions that can't be checked by PID (legacy names,
+# or another host sharing $HOME) are removed once older than this (minutes).
 KUBENV_CLEANUP_AGE_MIN="${KUBENV_CLEANUP_AGE_MIN:-1440}"
+
+# How many backups of ~/.kube/config to keep.
+KUBENV_BACKUPS="${KUBENV_BACKUPS:-10}"
 
 function _kubenv_usage()
 {
@@ -14,7 +18,8 @@ function _kubenv_usage()
     echo "Remember to 'save' changes if you add new context (i.e. connect to new cluster)."
     echo
     echo "Usage:"
-    echo "      kubenv [use [on|off]]|save|reload|merge|split|clean"
+    echo "      kubenv use [on|off] | save [force] | merge [force] | split [force]"
+    echo "      kubenv reload | restore [list|<backup>] | clean"
     echo "      kubenv [(contexts|ctx)|(namespaces|ns)] [(cur|current)|all|-|<value-to-set>]"
     echo
     echo "Sub-commands:"
@@ -37,19 +42,23 @@ function _kubenv_usage()
     echo "      - any other argument sets namespace to that value"
     echo
     echo "save"
-    echo "      - persists changes for the CURRENT context's namespace/cluster/user"
-    echo "        back into its file in ${KUBENV_CONFIG_D}/, then rebuilds"
-    echo "        ${KUBENV_KUBECONFIG_DEFAULT} from ${KUBENV_CONFIG_D}/*.yaml"
+    echo "      - persists the CURRENT context (with its namespace/cluster/user) into"
+    echo "        every file in ${KUBENV_CONFIG_D}/ that already defines it, or into"
+    echo "        a new <context-name>.yaml, then runs 'merge'"
+    echo "      - 'force' is passed on to 'merge'"
     echo "      - resets current context to 'null' afterwards, you need to switch manually"
     echo
     echo "merge"
     echo "      - rebuilds ${KUBENV_KUBECONFIG_DEFAULT} from all files in"
     echo "        ${KUBENV_CONFIG_D}/*.yaml (does not touch per-cluster files)"
+    echo "      - refuses if that would drop contexts that are in ${KUBENV_KUBECONFIG_DEFAULT}"
+    echo "        but not in ${KUBENV_CONFIG_D}; 'kubenv merge force' drops them anyway"
     echo "      - resets current context to 'null' afterwards, you need to switch manually"
     echo
     echo "split"
     echo "      - reverse of 'merge': reads ${KUBENV_KUBECONFIG_DEFAULT} and writes"
     echo "        one file per context into ${KUBENV_CONFIG_D}/<context-name>.yaml"
+    echo "        ('/' in context names becomes '_')"
     echo "      - use this once to bootstrap ${KUBENV_CONFIG_D} from an existing config"
     echo "      - by default, existing files in ${KUBENV_CONFIG_D} are NOT overwritten"
     echo "        unless you pass 'force': kubenv split force"
@@ -60,13 +69,20 @@ function _kubenv_usage()
     echo "      - resets current context to 'null' afterwards, you need to switch manually"
     echo
     echo "restore"
-    echo "      - restores config from the last backup (config.bkp)"
+    echo "      - (no argument) - restores ${KUBENV_KUBECONFIG_DEFAULT} from the latest backup"
+    echo "      - list - lists backups in ${KUBENV_BACKUP_D} (newest last)"
+    echo "      - <backup> - restores that backup"
+    echo "      - a backup is taken before every merge/save/restore, the last"
+    echo "        ${KUBENV_BACKUPS} are kept; the current config is backed up first,"
+    echo "        so a restore can be undone with another restore"
     echo "      - resets current context to 'null' afterwards, you need to switch manually"
     echo
     echo "clean"
-    echo "      - removes stale per-session temp kubeconfig files from ${KUBENV_SUFFIX}"
-    echo "        (files older than ${KUBENV_CLEANUP_AGE_MIN} min that are not held open"
-    echo "        by any running shell); runs automatically every time kubenv is sourced"
+    echo "      - removes per-session temp kubeconfig files from ${KUBENV_SUFFIX}"
+    echo "        whose shell is no longer running; runs automatically every time"
+    echo "        kubenv is sourced"
+    echo "      - files that can't be checked this way (old names, other hosts) are"
+    echo "        removed after ${KUBENV_CLEANUP_AGE_MIN} min"
     echo "      - does NOT touch the current session's temp file"
     echo
 }
@@ -117,13 +133,15 @@ function _kubenv_ctx()
             echo "${current_context}"
             ;;
         "-")
-            if [[ ${KUBENV_ENABELED} == 0 && "${KUBENV_PREV_CTX}" != "" ]]
-            then
-                ${KUBENV_KUBECTL} config use-context "${KUBENV_PREV_CTX}"
-                KUBENV_PREV_CTX=${current_context}
-            elif [[ ${KUBENV_ENABELED} == 1 ]]
+            if [[ ${KUBENV_ENABELED} == 1 ]]
             then
                 echo "kubenv is disabled"
+            elif [[ "${KUBENV_PREV_CTX}" == "" ]]
+            then
+                echo "No previous context"
+            else
+                ${KUBENV_KUBECTL} config use-context "${KUBENV_PREV_CTX}"
+                KUBENV_PREV_CTX=${current_context}
             fi
             ;;
         *)
@@ -141,12 +159,16 @@ function _kubenv_ctx()
 function _kubenv_ns()
 {
     current_context=$(${KUBENV_KUBECTL} config current-context)
-    [[ ${current_context} = "null" ]] && return
+    if [[ ${current_context} = "null" ]]
+    then
+        echo "No context selected, run: kubenv ctx <name>" >&2
+        return 1
+    fi
 
     current_namespace=$(${KUBENV_KUBECTL} config view --output="jsonpath={.contexts[?(@.name==\"${current_context}\")].context.namespace}")
     case "${1}" in
         ""|all)
-            for c in $(${KUBENV_KUBECTL} get namespace --output="jsonpath={range.items[*]}{.metadata.name}:{end}"|tr ':' '\n')
+            for c in $(${KUBENV_KUBECTL} get namespace --request-timeout=10s --output="jsonpath={range.items[*]}{.metadata.name}:{end}"|tr ':' '\n')
             do
                 if [[ "${c}" == "${current_namespace}" ]]
                 then
@@ -160,13 +182,15 @@ function _kubenv_ns()
             echo "${current_namespace}"
             ;;
         "-")
-            if [[ ${KUBENV_ENABELED} == 0 && "${KUBENV_PREV_NS}" != "" ]]
-            then
-                ${KUBENV_KUBECTL} config set-context "${current_context}" --namespace "${KUBENV_PREV_NS}"
-                KUBENV_PREV_NS=${current_namespace}
-            elif [[ ${KUBENV_ENABELED} == 1 ]]
+            if [[ ${KUBENV_ENABELED} == 1 ]]
             then
                 echo "kubenv is disabled"
+            elif [[ "${KUBENV_PREV_NS}" == "" ]]
+            then
+                echo "No previous namespace"
+            else
+                ${KUBENV_KUBECTL} config set-context "${current_context}" --namespace "${KUBENV_PREV_NS}"
+                KUBENV_PREV_NS=${current_namespace}
             fi
             ;;
         *)
@@ -188,26 +212,38 @@ function _kubenv_ns()
 function _kubenv_reset_context()
 {
     # force to create null context
-    kubectl config set-cluster null --server=''  --certificate-authority='' --kubeconfig=${KUBENV_CONFIG} >/dev/null 2>&1
-    kubectl config set-credentials null --username='' --password='' --kubeconfig=${KUBENV_CONFIG} >/dev/null 2>&1
-    kubectl config set-context null --cluster=null --user=null --kubeconfig=${KUBENV_CONFIG} >/dev/null 2>&1
-    kubectl config use-context null --kubeconfig=${KUBENV_CONFIG} >/dev/null 2>&1
+    kubectl config set-cluster null --server=''  --certificate-authority='' --kubeconfig="${KUBENV_CONFIG}" >/dev/null 2>&1
+    kubectl config set-credentials null --username='' --password='' --kubeconfig="${KUBENV_CONFIG}" >/dev/null 2>&1
+    kubectl config set-context null --cluster=null --user=null --kubeconfig="${KUBENV_CONFIG}" >/dev/null 2>&1
+    kubectl config use-context null --kubeconfig="${KUBENV_CONFIG}" >/dev/null 2>&1
 
     KUBENV_PREV_CTX=""
     KUBENV_PREV_NS=""
     echo "Context reset to 'null', please switch context manually (kubenv ctx <name>)"
 }
 
-# Removes stale/unused temporary kubeconfig files from ${KUBENV_SUFFIX}
-# (files named kubenv.XXXXXXXXXX, created by mktemp every time this
-# script is sourced).
-#
-# A file is considered "dead" and removed if BOTH of the following hold:
-#   1. it is older than ${KUBENV_CLEANUP_AGE_MIN} minutes (1 day by default);
-#   2. it is not currently held open by any live process (checked via
-#      lsof/fuser when available - this protects files still in use by
-#      active sessions, even if those sessions have been idle longer
-#      than the threshold).
+# File name (without .yaml) for a context in config.d. Context names like
+# EKS ARNs contain '/', which can't be part of a file name, and ':', which
+# separates paths in KUBECONFIG; both become '_'.
+function _kubenv_file_name()
+{
+    local n="${1//\//_}"
+    echo "${n//:/_}"
+}
+
+# Writes stdin to a file readable only by the owner (kubeconfigs hold
+# credentials). Existing files keep their permissions.
+function _kubenv_write()
+{
+    (umask 077; cat > "${1}")
+}
+
+# Removes temporary kubeconfig files of sessions that are gone from
+# ${KUBENV_SUFFIX}. Each session's file is named
+# kubenv.<host>.<shell-pid>.XXXXXXXXXX, so a file of this host is removed
+# as soon as its shell is no longer running. Files that can't be checked
+# this way (old kubenv.XXXXXXXXXX names, or another host sharing $HOME)
+# are removed once older than ${KUBENV_CLEANUP_AGE_MIN} minutes.
 # The current session's own file (${KUBENV_CONFIG}, if already set) is
 # always skipped.
 #
@@ -217,8 +253,8 @@ function _kubenv_reset_context()
 function _kubenv_cleanup_old()
 {
     local verbose="${1:-0}"
-    local removed=0 skipped_open=0 skipped_young=0
-    local f age_min
+    local removed=0 skipped_alive=0 skipped_young=0
+    local f rest fhost pid host="${HOSTNAME%%.*}"
 
     [[ -d "${KUBENV_SUFFIX}" ]] || return 0
 
@@ -227,30 +263,22 @@ function _kubenv_cleanup_old()
         [[ -f "${f}" ]] || continue
         [[ -n "${KUBENV_CONFIG}" && "${f}" == "${KUBENV_CONFIG}" ]] && continue
 
-        # Skip files younger than the threshold, so we don't touch files
-        # that other sessions are creating right now, in parallel.
-        if [[ -n "$(find "${f}" -mmin "-${KUBENV_CLEANUP_AGE_MIN}" 2>/dev/null)" ]]
+        rest="${f##*/kubenv.}"          # <host>.<pid>.<random> or <random>
+        fhost="${rest%%.*}"
+        rest="${rest#*.}"
+        pid="${rest%%.*}"
+
+        if [[ "${fhost}" == "${host}" && "${pid}" =~ ^[0-9]+$ ]]
+        then
+            if ps -p "${pid}" >/dev/null 2>&1
+            then
+                skipped_alive=$((skipped_alive + 1))
+                continue
+            fi
+        elif [[ -n "$(find "${f}" -mmin "-${KUBENV_CLEANUP_AGE_MIN}" 2>/dev/null)" ]]
         then
             skipped_young=$((skipped_young + 1))
             continue
-        fi
-
-        # Don't touch the file if it's still open by some live session
-        # (e.g. a long-running terminal holding onto an old file).
-        if command -v lsof >/dev/null 2>&1
-        then
-            if lsof -- "${f}" >/dev/null 2>&1
-            then
-                skipped_open=$((skipped_open + 1))
-                continue
-            fi
-        elif command -v fuser >/dev/null 2>&1
-        then
-            if fuser "${f}" >/dev/null 2>&1
-            then
-                skipped_open=$((skipped_open + 1))
-                continue
-            fi
         fi
 
         rm -f -- "${f}"
@@ -259,7 +287,7 @@ function _kubenv_cleanup_old()
 
     if [[ "${verbose}" == "1" ]]
     then
-        echo "kubenv clean: removed ${removed} stale file(s), skipped ${skipped_open} in use, ${skipped_young} too recent"
+        echo "kubenv clean: removed ${removed} stale file(s), skipped ${skipped_alive} of running shells, ${skipped_young} too recent to tell"
     fi
 }
 
@@ -275,7 +303,13 @@ function _kubenv_build_merged()
     then
         for f in "${KUBENV_CONFIG_D}"/*.yaml "${KUBENV_CONFIG_D}"/*.yml
         do
-            [[ -f "${f}" ]] && files+=("${f}")
+            [[ -f "${f}" ]] || continue
+            if [[ "${f}" == *:* ]]
+            then
+                echo "Skipping ${f}: ':' in the name breaks KUBECONFIG, rename the file" >&2
+                continue
+            fi
+            files+=("${f}")
         done
     fi
 
@@ -291,15 +325,124 @@ function _kubenv_build_merged()
     KUBECONFIG="${joined}" kubectl config view --flatten --raw
 }
 
+# Prints backup files, oldest first (names sort by date).
+function _kubenv_backups()
+{
+    local f
+    for f in "${KUBENV_BACKUP_D}"/config.*
+    do
+        [[ -f "${f}" ]] && echo "${f}"
+    done
+}
+
+# Copies ~/.kube/config to ${KUBENV_BACKUP_D}/config.<date>, unless it is
+# empty or the same as the latest backup, and keeps the last
+# ${KUBENV_BACKUPS} backups.
+function _kubenv_backup()
+{
+    [[ -s "${KUBENV_KUBECONFIG_DEFAULT}" ]] || return 0
+    mkdir -p "${KUBENV_BACKUP_D}" || return 1
+
+    local files=() f
+    while IFS= read -r f; do files+=("${f}"); done < <(_kubenv_backups)
+
+    if [[ ${#files[@]} -gt 0 ]] && cmp -s "${files[${#files[@]}-1]}" "${KUBENV_KUBECONFIG_DEFAULT}"
+    then
+        return 0
+    fi
+
+    f="${KUBENV_BACKUP_D}/config.$(date +%Y%m%d-%H%M%S)"
+    local base="${f}" i=1
+    while [[ -e "${f}" ]]; do f="${base}-$((i++))"; done
+    _kubenv_write "${f}" < "${KUBENV_KUBECONFIG_DEFAULT}" || return 1
+    files+=("${f}")
+
+    local i n=$(( ${#files[@]} - KUBENV_BACKUPS ))
+    for (( i = 0; i < n; i++ ))
+    do
+        rm -f -- "${files[i]}"
+    done
+}
+
+function _kubenv_restore()
+{
+    local src f files=()
+    while IFS= read -r f; do files+=("${f}"); done < <(_kubenv_backups)
+
+    case "${1}" in
+        list)
+            if [[ ${#files[@]} -eq 0 ]]
+            then
+                echo "No backups in ${KUBENV_BACKUP_D}"
+            else
+                for f in "${files[@]}"; do echo "${f##*/}"; done
+            fi
+            return 0
+            ;;
+        "")
+            if [[ ${#files[@]} -gt 0 ]]
+            then
+                src="${files[${#files[@]}-1]}"
+            else
+                src="${KUBENV_SUFFIX}config.bkp"   # backup from older kubenv versions
+            fi
+            ;;
+        *)
+            src="${KUBENV_BACKUP_D}/${1##*/}"
+            ;;
+    esac
+
+    if [[ ! -f "${src}" ]]
+    then
+        echo "No backup to restore${1:+: ${1}} (see: kubenv restore list)" >&2
+        return 1
+    fi
+
+    # Take the backup aside first: backing up the current config below may
+    # rotate the oldest backup away.
+    local tmp
+    tmp=$(mktemp "${KUBENV_SUFFIX}restore.XXXXXXXXXX") || return 1
+    cp -- "${src}" "${tmp}" || { rm -f -- "${tmp}"; return 1; }
+
+    _kubenv_backup
+    _kubenv_write "${KUBENV_KUBECONFIG_DEFAULT}" < "${tmp}"
+    rm -f -- "${tmp}"
+    cp "${KUBENV_KUBECONFIG_DEFAULT}" "${KUBENV_CONFIG}"
+
+    echo "Restored ${KUBENV_KUBECONFIG_DEFAULT} from ${src}"
+    _kubenv_reset_context
+}
+
 # Rebuilds ~/.kube/config from ~/.kube/config.d/*.yaml
 function _kubenv_merge()
 {
-    local merged
-    merged=$(_kubenv_build_merged) || return 1
+    local force="${1}" tmp missing
 
-    cp "${KUBENV_KUBECONFIG_DEFAULT}" "${KUBENV_SUFFIX}/config.bkp" 2>/dev/null
+    tmp=$(mktemp "${KUBENV_SUFFIX}merge.XXXXXXXXXX") || return 1
+    if ! _kubenv_build_merged > "${tmp}"
+    then
+        rm -f -- "${tmp}"
+        return 1
+    fi
 
-    echo "${merged}" > "${KUBENV_KUBECONFIG_DEFAULT}"
+    # Contexts that are only in ~/.kube/config (not split yet, or added
+    # there by another tool) would be lost.
+    missing=$(comm -23 \
+        <(kubectl --kubeconfig="${KUBENV_KUBECONFIG_DEFAULT}" config get-contexts --output=name 2>/dev/null | grep -vxF null | sort) \
+        <(kubectl --kubeconfig="${tmp}" config get-contexts --output=name 2>/dev/null | sort))
+
+    if [[ -n "${missing}" && "${force}" != "force" ]]
+    then
+        echo "Not rebuilding ${KUBENV_KUBECONFIG_DEFAULT}: these contexts are in it but not in ${KUBENV_CONFIG_D}:" >&2
+        echo "${missing}" | sed 's/^/  /' >&2
+        echo "Add them with 'kubenv split' (keeps existing files), or drop them with 'kubenv merge force'" >&2
+        rm -f -- "${tmp}"
+        return 1
+    fi
+
+    _kubenv_backup
+    _kubenv_write "${KUBENV_KUBECONFIG_DEFAULT}" < "${tmp}"
+    rm -f -- "${tmp}"
     echo "Rebuilt ${KUBENV_KUBECONFIG_DEFAULT} from $(ls "${KUBENV_CONFIG_D}"/*.yaml "${KUBENV_CONFIG_D}"/*.yml 2>/dev/null | wc -l | tr -d ' ') file(s) in ${KUBENV_CONFIG_D}"
 
     # pick up the result in the current session too
@@ -308,14 +451,16 @@ function _kubenv_merge()
     _kubenv_reset_context
 }
 
-# Saves the current context (cluster/user/context/namespace) back to its
-# own file in config.d/<cluster-name>.yaml, then rebuilds the combined
-# ~/.kube/config from all files in config.d.
+# Saves the current context (cluster/user/context/namespace) into every
+# file in config.d that already defines it (other entries in those files
+# are kept), or into a new config.d/<context-name>.yaml, then rebuilds the
+# combined ~/.kube/config from all files in config.d.
 function _kubenv_save()
 {
+    local force="${1}"
     mkdir -p "${KUBENV_CONFIG_D}"
 
-    local current_context cluster_name file
+    local current_context
     current_context=$(${KUBENV_KUBECTL} config current-context 2>/dev/null)
 
     if [[ -z "${current_context}" || "${current_context}" == "null" ]]
@@ -324,27 +469,62 @@ function _kubenv_save()
         return 1
     fi
 
-    cluster_name=$(${KUBENV_KUBECTL} config view --raw --output="jsonpath={.contexts[?(@.name==\"${current_context}\")].context.cluster}")
-    if [[ -z "${cluster_name}" ]]
+    local files=() f
+    for f in "${KUBENV_CONFIG_D}"/*.yaml "${KUBENV_CONFIG_D}"/*.yml
+    do
+        # files with ':' can't be merged (see _kubenv_build_merged)
+        [[ -f "${f}" && "${f}" != *:* ]] || continue
+        if kubectl --kubeconfig="${f}" config get-contexts --output=name 2>/dev/null | grep -qxF -- "${current_context}"
+        then
+            files+=("${f}")
+        fi
+    done
+
+    if [[ ${#files[@]} -eq 0 ]]
     then
-        cluster_name="${current_context}"
+        files=("${KUBENV_CONFIG_D}/$(_kubenv_file_name "${current_context}").yaml")
+    elif [[ ${#files[@]} -gt 1 ]]
+    then
+        echo "Context '${current_context}' is defined in several files, updating all of them:"
+        printf '  %s\n' "${files[@]}"
     fi
 
-    file="${KUBENV_CONFIG_D}/${cluster_name}.yaml"
-
     # The minified (--minify) config contains only the current
-    # context/cluster/user - exactly what's needed for a per-cluster file.
-    ${KUBENV_KUBECTL} config view --raw --minify --flatten > "${file}"
+    # context/cluster/user.
+    local cur tmp failed=0
+    cur=$(mktemp "${KUBENV_SUFFIX}save.XXXXXXXXXX") || return 1
+    if ! ${KUBENV_KUBECTL} config view --raw --minify --flatten > "${cur}"
+    then
+        rm -f -- "${cur}"
+        return 1
+    fi
 
-    echo "Saved context '${current_context}' to ${file}"
+    for f in "${files[@]}"
+    do
+        tmp=$(mktemp "${KUBENV_SUFFIX}save.XXXXXXXXXX") || { failed=1; break; }
+        # The first file wins on name clashes, so the current values
+        # replace the old ones while other entries of ${f} stay. ${f} may not exist yet,
+        # kubectl skips missing files.
+        if KUBECONFIG="${cur}:${f}" kubectl config view --raw --flatten > "${tmp}" \
+            && _kubenv_write "${f}" < "${tmp}"
+        then
+            echo "Saved context '${current_context}' to ${f}"
+        else
+            echo "Failed to save context '${current_context}' to ${f}" >&2
+            failed=1
+        fi
+        rm -f -- "${tmp}"
+    done
+    rm -f -- "${cur}"
+
+    [[ ${failed} == 0 ]] || return 1
 
     # _kubenv_merge already resets the context at the end
-    _kubenv_merge
+    _kubenv_merge "${force}"
 }
 
-# Reverse of merge/save: reads ~/.kube/config (or KUBENV_CONFIG - the
-# current working copy, if merge hasn't been run yet) and splits every
-# context out into its own file config.d/<context-name>.yaml.
+# Reverse of merge/save: reads ~/.kube/config and splits every context out
+# into its own file config.d/<context-name>.yaml.
 # By default, existing files are left untouched (so manual edits aren't
 # overwritten) - pass "force" as the first argument to overwrite all.
 function _kubenv_split()
@@ -361,13 +541,13 @@ function _kubenv_split()
         return 1
     fi
 
-    local ctx file written=0 skipped=0
-    for ctx in ${contexts}
+    local ctx file written=0 skipped=0 failed=0
+    while IFS= read -r ctx
     do
         # "null" is kubenv's own internal context, skip it
-        [[ "${ctx}" == "null" ]] && continue
+        [[ -z "${ctx}" || "${ctx}" == "null" ]] && continue
 
-        file="${KUBENV_CONFIG_D}/${ctx}.yaml"
+        file="${KUBENV_CONFIG_D}/$(_kubenv_file_name "${ctx}").yaml"
 
         if [[ -f "${file}" && "${force}" != "force" ]]
         then
@@ -376,12 +556,19 @@ function _kubenv_split()
             continue
         fi
 
-        KUBECONFIG="${KUBENV_KUBECONFIG_DEFAULT}" kubectl config view --raw --minify --flatten --context="${ctx}" > "${file}"
-        echo "Wrote ${file}"
-        written=$((written + 1))
-    done
+        if kubectl --kubeconfig="${KUBENV_KUBECONFIG_DEFAULT}" config view --raw --minify --flatten --context="${ctx}" | _kubenv_write "${file}" \
+            && [[ ${PIPESTATUS[0]} == 0 ]]
+        then
+            echo "Wrote ${file}"
+            written=$((written + 1))
+        else
+            echo "Failed to write ${file}" >&2
+            rm -f -- "${file}"
+            failed=$((failed + 1))
+        fi
+    done <<< "${contexts}"
 
-    echo "Split done: ${written} file(s) written, ${skipped} skipped."
+    echo "Split done: ${written} file(s) written, ${skipped} skipped, ${failed} failed."
 
     _kubenv_reset_context
 }
@@ -401,15 +588,13 @@ function kubenv()
                 _kubenv_ns "${2}"
                 ;;
             restore)
-                cp "${KUBENV_SUFFIX}/config.bkp" "${KUBENV_KUBECONFIG_DEFAULT}"
-                cp "${KUBENV_KUBECONFIG_DEFAULT}" "${KUBENV_CONFIG}"
-                _kubenv_reset_context
+                _kubenv_restore "${2}"
                 ;;
             save)
-                _kubenv_save
+                _kubenv_save "${2}"
                 ;;
             merge)
-                _kubenv_merge
+                _kubenv_merge "${2}"
                 ;;
             split)
                 _kubenv_split "${2}"
@@ -447,10 +632,16 @@ _kubenv_complete()
                     COMPREPLY=($(compgen -W "$(${KUBENV_KUBECTL} config get-contexts --output=name)" -- ${cur}))
                     ;;
                 namespaces|ns)
-                    COMPREPLY=($(compgen -W "$(${KUBENV_KUBECTL} get namespace --output="jsonpath={range.items[*]}{.metadata.name}:{end}"|tr ':' '\n')" -- ${cur}))
+                    COMPREPLY=($(compgen -W "$(${KUBENV_KUBECTL} get namespace --request-timeout=3s --output="jsonpath={range.items[*]}{.metadata.name}:{end}" 2>/dev/null|tr ':' '\n')" -- ${cur}))
                     ;;
-                split)
+                use)
+                    COMPREPLY=($(compgen -W "on off" -- ${cur}))
+                    ;;
+                save|merge|split)
                     COMPREPLY=($(compgen -W "force" -- ${cur}))
+                    ;;
+                restore)
+                    COMPREPLY=($(compgen -W "list $(_kubenv_backups | sed 's|.*/||')" -- ${cur}))
                     ;;
             esac
             ;;
@@ -462,6 +653,22 @@ _kubenv_complete()
 
 complete -F _kubenv_complete kubenv
 
+function _kubenv_on_exit()
+{
+    [[ -n "${KUBENV_CONFIG}" ]] && rm -f -- "${KUBENV_CONFIG}"
+}
+
+# Adds _kubenv_on_exit to the shell's EXIT trap, keeping a trap that is
+# already set (e.g. in ~/.bashrc).
+function _kubenv_install_trap()
+{
+    eval "set -- $(trap -p EXIT)"   # -> trap -- '<command>' EXIT
+    case "${3}" in
+        *_kubenv_on_exit*) return ;;
+    esac
+    trap "_kubenv_on_exit${3:+; ${3}}" EXIT
+}
+
 # Main
 if [ ! "${0}" != "${BASH_SOURCE[0]}" ]
 then
@@ -472,21 +679,25 @@ then
     exit 1
 fi
 
-[ ! -d $HOME/.kube ] && mkdir $HOME/.kube
+[ ! -d "$HOME/.kube" ] && mkdir "$HOME/.kube"
 [ ! -d "${KUBENV_CONFIG_D}" ] && mkdir -p "${KUBENV_CONFIG_D}"
-[ ! -f $KUBENV_KUBECONFIG_DEFAULT ] && touch $KUBENV_KUBECONFIG_DEFAULT
+[ ! -f "$KUBENV_KUBECONFIG_DEFAULT" ] && touch "$KUBENV_KUBECONFIG_DEFAULT"
 
 mkdir -p "${KUBENV_SUFFIX}" || echo "Failed to create config directory"
+
+# Sourced again in the same shell: drop the previous file of this session.
+_kubenv_on_exit
+KUBENV_CONFIG=""
 
 # Silently clean up other sessions' stale temp files before creating
 # our own.
 _kubenv_cleanup_old 0
 
-KUBENV_CONFIG=$(mktemp "${KUBENV_SUFFIX}kubenv.XXXXXXXXXX")
+KUBENV_CONFIG=$(mktemp "${KUBENV_SUFFIX}kubenv.${HOSTNAME%%.*}.$$.XXXXXXXXXX")
 cp "${KUBENV_KUBECONFIG_DEFAULT}" "${KUBENV_CONFIG}"
 export KUBECONFIG="${KUBENV_CONFIG}"
 
-trap "rm ${KUBENV_CONFIG}" EXIT
+_kubenv_install_trap
 KUBENV_KUBECTL="kubectl --kubeconfig=${KUBENV_CONFIG}"
 KUBENV_PREV_CTX=""
 KUBENV_PREV_NS=""
