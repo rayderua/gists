@@ -1,6 +1,6 @@
-# ~/.agent.sh - share projects with an isolated agent user
+# ~/.claude-agent.sh - share projects with an isolated agent user
 # Usage: add to ~/.bashrc
-#   [ -f ~/.agent.sh ] && . ~/.agent.sh
+#   [ -f ~/.claude-agent.sh ] && . ~/.claude-agent.sh
 #
 # Shares are bindfs mounts and are not persisted: they are gone after a reboot.
 # Run `claude-agent help` for the list of subcommands.
@@ -20,8 +20,10 @@ claude-agent remove <name>         - forget a project (must be unshared)
 claude-agent share <name> [path]   - share a project with the agent
 claude-agent unshare <name>        - stop sharing a project
 claude-agent shell                 - login shell as the agent user
-claude-agent run [name] [args...]  - run claude in a shared project
-claude-agent <name> [args...]      - same, short form
+claude-agent run [name] [--new] [args...]
+                                   - run claude in a shared project, continuing
+                                     its last session (--new: start a fresh one)
+claude-agent <name> [--new] [args...] - same, short form
 
 share without a path uses the registered path for <name>, or \$PWD if <name>
 is not registered yet. share with a path registers/updates <name>.
@@ -194,9 +196,37 @@ _claude_agent_run() {
     fi
     dir="$AGENT_PROJECTS/$1"; shift
   fi
-  local cmd="cd $(printf %q "$dir") && exec ~/.local/bin/claude"
-  local a; for a in "$@"; do cmd+=" $(printf %q "$a")"; done
-  sudo -u "$AGENT_USER" -H bash -lc "$cmd"
+  local new=
+  if [ "$1" = "--new" ]; then new=1; shift; fi
+
+  local cmd="cd $(printf %q "$dir") || exit 1"
+  if [ -z "$new" ] && _claude_agent_should_continue "$@"; then
+    # claude keeps sessions in <config>/projects/<cwd with non-alnum -> '-'>;
+    # add -c only if one exists, otherwise claude -c fails
+    local enc
+    enc="$(printf %s "$dir" | sed 's/[^A-Za-z0-9]/-/g')"
+    cmd+="; compgen -G \"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/$enc/*.jsonl\" >/dev/null && set -- -c \"\$@\""
+  fi
+  cmd+="; exec ~/.local/bin/claude \"\$@\""
+  sudo -u "$AGENT_USER" -H bash -lc "$cmd" bash "$@"
+}
+
+# continue by default, unless the args already pick a session or are not
+# an interactive/prompt run (subcommands, --help, --version)
+_claude_agent_should_continue() {
+  case "$1" in
+    mcp|config|doctor|update|install|plugin|setup-token|migrate-installer|agents)
+      return 1 ;;
+  esac
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -c|--continue|-r|--resume|--resume=*|--session-id|--session-id=*|--from-pr*|\
+      -h|--help|-v|--version)
+        return 1 ;;
+    esac
+  done
+  return 0
 }
 
 claude-agent() {
@@ -246,8 +276,16 @@ _claude_agent_complete() {
     remove)
       [ "$pos" -eq 1 ] && COMPREPLY=($(compgen -W "$(_claude_agent_cfg_names)" -- "$cur"))
       ;;
-    unshare|run)
+    unshare)
       [ "$pos" -eq 1 ] && COMPREPLY=($(compgen -W "$(_claude_agent_shared_names)" -- "$cur"))
+      ;;
+    run)
+      [ "$pos" -eq 1 ] && COMPREPLY=($(compgen -W "$(_claude_agent_shared_names)" -- "$cur"))
+      [ "$pos" -eq 2 ] && COMPREPLY=($(compgen -W "--new" -- "$cur"))
+      ;;
+    *)
+      # short form: claude-agent <name> --new
+      [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "--new" -- "$cur"))
       ;;
   esac
 }
