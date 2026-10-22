@@ -1,0 +1,18 @@
+# --- JetBrains (GoLand / IntelliJ) ---
+.idea/
+out/
+# --- Teep ---
+.tmp/
+
+# --- Python ---
+.venv/
+
+# --- Secrets / local env ---
+.env
+*.token
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
