@@ -1,9 +1,12 @@
-# ~/.claude-agent.sh - share projects with an isolated agent user
-# Usage: add to ~/.bashrc
+# shellcheck shell=bash
+# claude-agent - run Claude Code as an isolated user in projects you share
+#
+# Source it, don't run it. Install with ./install.sh, then add to ~/.bashrc:
 #   [ -f ~/.claude-agent.sh ] && . ~/.claude-agent.sh
 #
 # Shares are bindfs mounts and are not persisted: they are gone after a reboot.
 # Run `claude-agent help` for the list of subcommands.
+# Setup (agent user, bindfs, sudo): docs/claude-agent.md
 
 AGENT_USER="${AGENT_USER:-claude}"
 AGENT_HOME="${AGENT_HOME:-/home/$AGENT_USER}"

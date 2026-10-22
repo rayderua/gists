@@ -1,4 +1,12 @@
-#!/bin/bash
+# shellcheck shell=bash
+# kubenv - per-shell kubectl context/namespace, kubeconfig kept in
+# ~/.kube/config.d/*.yaml and merged into ~/.kube/config
+#
+# Source it, don't run it. Install with ./install.sh, then add to ~/.bashrc:
+#   [ -f ~/.kubenv.sh ] && . ~/.kubenv.sh
+#
+# Run `kubenv help` for the list of subcommands. Details: docs/kubenv.md
+
 KUBENV_SUFFIX="${HOME}/.kube/kubenv/"
 KUBENV_KUBECONFIG_DEFAULT="${HOME}/.kube/config"
 KUBENV_CONFIG_D="${HOME}/.kube/config.d"

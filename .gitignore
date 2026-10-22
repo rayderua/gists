@@ -1,7 +1,7 @@
 # --- JetBrains (GoLand / IntelliJ) ---
 .idea/
 out/
-# --- Teep ---
+# --- Temp ---
 .tmp/
 
 # --- Python ---
